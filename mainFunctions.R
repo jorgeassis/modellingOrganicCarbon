@@ -61,6 +61,76 @@ for(package in packages.to.use) {
 
 ## -----------------------
 
+predictRasterTiled <- function(raster_input, model, tile_size_cells, output_dir, filename_prefix = "prediction_tile", n.trees = NULL, maxValue, nCores=10) {
+
+  if (!dir.exists(output_dir)) {
+    dir.create(output_dir, recursive = TRUE)
+  }
+  
+  raster_extent <- ext(raster_input)
+  min_x <- raster_extent[1]
+  max_x <- raster_extent[2]
+  min_y <- raster_extent[3]
+  max_y <- raster_extent[4]
+  
+  # Calculate the number of tiles in x and y directions
+  n_col_tiles <- ceiling((max_x - min_x) / tile_size_cells)
+  n_row_tiles <- ceiling((max_y - min_y) / tile_size_cells)
+  
+  # List to store paths of the saved tile predictions
+  tile_paths <- character(0)
+  
+  # Loop through rows and columns of tiles
+
+  comb <- expand.grid(i=1:n_row_tiles,j=1:n_col_tiles)
+  
+  cl <- parallel::makeCluster(nCores)
+  registerDoParallel(cl)
+  
+  doParallel <- foreach(c = 1:nrow(comb), .combine=rbind, .packages = c("gbm","dismo","terra")) %dopar% {
+      
+      i <- comb[c,1]
+      j <- comb[c,2]
+
+      # Calculate the extent for the current tile
+      tile_min_x <- min_x + (j - 1) * tile_size_cells
+      tile_max_x <- min(min_x + j * tile_size_cells, max_x)
+      tile_min_y <- max_y - i * tile_size_cells
+      tile_max_y <- max(max_y - (i - 1) * tile_size_cells, min_y)
+      
+      tile_extent <- ext(tile_min_x, tile_max_x, tile_min_y, tile_max_y)
+      
+      # Crop the input raster to the current tile
+      tile <- terra::crop(rast(raster_input), tile_extent)
+      
+      # Check if the tile has any data (avoid predicting on empty tiles)
+      if ( sum(!is.na(values(tile[[1]])[,1])) != 0) {
+        # Predict using the provided model
+        
+        prediction_tile <- predict(tile, model, n.trees = ifelse(is.null(n.trees), model$n.trees, n.trees), type = "response")
+        prediction_tile <- mask(prediction_tile,tile[[1]])
+        prediction_tile[prediction_tile >= log(maxValue) ] <- log(maxValue)
+        
+        tile_filename <- file.path(output_dir, paste0(filename_prefix, "_", i, "_", j, "Log.tif"))
+        writeRaster(prediction_tile, tile_filename, overwrite = TRUE)
+      
+        prediction_tile <- exp(prediction_tile)
+        prediction_tile[prediction_tile >= maxValue ] <- maxValue
+        
+        tile_filename <- file.path(output_dir, paste0(filename_prefix, "_", i, "_", j, "Exp.tif"))
+        writeRaster(prediction_tile, tile_filename, overwrite = TRUE)
+        
+    }
+  }
+  
+  stopCluster(cl); rm(cl) ; gc(reset=TRUE)
+  closeAllConnections()
+  
+  return(NULL)
+}
+
+## -----------------------
+
 Mode <- function(x) {
   ux <- unique(x)
   ux[which.max(tabulate(match(x, ux)))]
@@ -1008,3 +1078,30 @@ correctDateLineMap <- function(spatialObjectSF) {
   
   return(dggsOcean)      
 }
+
+
+## ───────────────────────────────────────────────────────
+
+fill_gaps_idw <- function(rlist, template,
+                          idp  = 2,  # power
+                          nmax = 12  # nearest neighbours
+) {
+  
+  train_cells <- which(!is.na(values(rlist)))
+  train_xy    <- xyFromCell(rlist, train_cells)
+  train_val   <- values(rlist)[train_cells]
+  train_pts <- vect(train_xy, crs = crs(rlist))
+  train_pts <- as(train_pts, "Spatial")
+  train_pts$z <- train_val
+  train_pts <- as.data.frame(train_pts)
+  
+  gap_pts <- xyFromCell(rlist, which( is.na(rlist[][,1])  & ! is.na(template[][,1]) ))      # matrix with two columns
+  
+  nn <- RANN::nn2(data = as.matrix(train_pts[,c("x","y")]),query = as.matrix(gap_pts),k = 1)  
+  preds <- train_pts[nn$nn.idx[,1],"z"]
+  
+  filled <- rlist
+  filled[which( is.na(rlist[][,1])  & ! is.na(template[][,1]) )] <- preds
+  return(filled)
+}
+
